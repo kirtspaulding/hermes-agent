@@ -44,6 +44,19 @@ _ensure_discord_mock()
 from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 
 
+def test_format_message_compacts_blank_lines_around_code_fences():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    content = "Use this:\n\n```bash\nprintf 'ok'\n```\n\nThen run it."
+
+    assert adapter.format_message(content) == (
+        "Use this:\n"
+        "```bash\n"
+        "printf 'ok'\n"
+        "```\n"
+        "Then run it."
+    )
+
+
 @pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))

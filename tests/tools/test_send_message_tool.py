@@ -1057,6 +1057,26 @@ class TestSendToPlatformDiscordThread:
         _, call_kwargs = send_mock.await_args
         assert call_kwargs["thread_id"] is None
 
+    def test_discord_code_fence_spacing_is_compacted_before_send(self):
+        """Discord tool sends should avoid extra blank lines around code blocks."""
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+        message = "Use this:\n\n```bash\nprintf 'ok'\n```\n\nDone."
+
+        with patch("tools.send_message_tool._send_discord", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "9876543210",
+                    message,
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once()
+        call_args, _ = send_mock.await_args
+        assert call_args[2] == "Use this:\n```bash\nprintf 'ok'\n```\nDone."
+
 
 # ---------------------------------------------------------------------------
 # Discord media attachment support
