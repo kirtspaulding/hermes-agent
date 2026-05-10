@@ -546,6 +546,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         except Exception:
             logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
+    if platform == Platform.DISCORD and message:
+        try:
+            discord_adapter = DiscordAdapter.__new__(DiscordAdapter)
+            message = discord_adapter.format_message(message)
+        except Exception:
+            logger.debug("Failed to apply Discord markdown formatting in _send_to_platform", exc_info=True)
+
     # Platform message length limits (from adapter class attributes)
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,

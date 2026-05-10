@@ -31,6 +31,42 @@ _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 
+
+def compact_code_block_spacing(content: str) -> str:
+    """Remove extra blank spacer lines directly around Discord code fences."""
+    if "```" not in content:
+        return content
+
+    output: list[str] = []
+    in_code_block = False
+    drop_blanks_after_closing_fence = False
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        is_blank = stripped == ""
+        is_fence = stripped.startswith("```")
+
+        if drop_blanks_after_closing_fence and is_blank:
+            continue
+        drop_blanks_after_closing_fence = False
+
+        if is_fence:
+            if in_code_block:
+                output.append(line)
+                in_code_block = False
+                drop_blanks_after_closing_fence = True
+                continue
+
+            while output and output[-1].strip() == "":
+                output.pop()
+            output.append(line)
+            in_code_block = True
+            continue
+
+        output.append(line)
+
+    return "\n".join(output)
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -2821,8 +2857,9 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Discord uses its own markdown variant.
         """
-        # Discord markdown is fairly standard, no special escaping needed
-        return content
+        # Discord markdown is fairly standard, but extra blank lines around
+        # fenced code blocks make bot replies look much taller than intended.
+        return compact_code_block_spacing(content)
 
     async def _run_simple_slash(
         self,

@@ -63,6 +63,13 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_CROSSCUT_PROJECT_ROOT = Path("/home/vice/CrossCut/crosscut")
+
+
+def _ensure_crosscut_project_import_path() -> None:
+    root = str(_CROSSCUT_PROJECT_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -12854,15 +12861,52 @@ class GatewayRunner:
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+        project_slug = self._resolve_family_chat_project_slug(context.source)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+            parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
+            guild_id=str(getattr(context.source, "guild_id", "") or ""),
+            message_id=str(getattr(context.source, "message_id", "") or ""),
+            project_slug=project_slug,
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
         )
+
+    def _resolve_family_chat_project_slug(self, source: SessionSource) -> str:
+        try:
+            if os.getenv("HERMES_PROFILE", "") != "family-chat":
+                return ""
+            _ensure_crosscut_project_import_path()
+            from crosscut.family_chat_projects import load_project_registry
+            registry = load_project_registry()
+            project = registry.resolve_thread(
+                getattr(source, "thread_id", None),
+                getattr(source, "parent_chat_id", None),
+            )
+            return project.slug if project else ""
+        except Exception:
+            return ""
+
+    def _family_chat_project_context_prompt(self, source: SessionSource) -> str:
+        try:
+            if os.getenv("HERMES_PROFILE", "") != "family-chat":
+                return ""
+            _ensure_crosscut_project_import_path()
+            from crosscut.family_chat_projects import render_project_surface_prompt, resolve_project_surface
+            surface = resolve_project_surface(
+                thread_id=getattr(source, "thread_id", None),
+                parent_chat_id=getattr(source, "parent_chat_id", None),
+                chat_name=getattr(source, "chat_name", None),
+                chat_type=getattr(source, "chat_type", None),
+            )
+            return render_project_surface_prompt(surface)
+        except Exception as exc:
+            logger.debug("family-chat project context resolver failed: %s", exc)
+            return ""
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -14662,6 +14706,9 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            project_context_prompt = self._family_chat_project_context_prompt(source).strip()
+            if project_context_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + project_context_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
