@@ -259,6 +259,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "project_resource": {
+        "description": "Family-chat project resource lookup and Discord attachment delivery",
+        "tools": ["project_resource"],
+        "includes": [],
+    },
+
     "yuanbao": {
         "description": "Yuanbao platform tools - group info, member queries, DM, stickers",
         "tools": [
@@ -397,6 +403,7 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS + [
             "discord",
             "discord_admin",
+            "project_resource",
         ],
         "includes": []
     },
