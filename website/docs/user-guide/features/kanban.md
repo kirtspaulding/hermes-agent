@@ -75,7 +75,11 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 
 By default Kanban stores each board in SQLite (`~/.hermes/kanban.db` for the default board, or `~/.hermes/kanban/boards/<slug>/kanban.db` for named boards). This remains the safest default and the rollback target.
 
-The CLI, dispatcher, and worker tools route through a provider seam so specialized deployments can opt into another backend for a specific process. Provider selection is intentionally environment-scoped, not a silent global migration:
+The CLI, dispatcher, and worker tools route through a provider seam so specialized deployments can opt into another backend for a specific process. Provider selection is intentionally environment-scoped, not a silent global migration. The CrossCut provider also needs the optional runtime deps installed in the Hermes environment that runs workers:
+
+```bash
+python -m pip install 'hermes-agent[crosscut]'
+```
 
 ```bash
 # Default: SQLite

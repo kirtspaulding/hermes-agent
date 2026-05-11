@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -789,6 +790,92 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _crosscut_dispatch_once(args: argparse.Namespace) -> kb.DispatchResult:
+    """Dispatch one tick against the CrossCut/Postgres Kanban provider."""
+    provider = get_kanban_cli_provider()
+    result = kb.DispatchResult()
+    max_spawn = getattr(args, "max", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+    board = os.environ.get("HERMES_KANBAN_BOARD") or kb.get_current_board()
+
+    tasks = sorted(
+        provider.list_tasks(assignee=None, status="ready", tenant=None, include_archived=False),
+        key=lambda t: (-int(t.priority or 0), int(t.created_at or 0), t.id),
+    )
+    spawned = 0
+    for task in tasks:
+        if max_spawn is not None and spawned >= int(max_spawn):
+            break
+        if not task.assignee:
+            result.skipped_unassigned.append(task.id)
+            continue
+        try:
+            from hermes_cli.profiles import normalize_profile_name, profile_exists
+            profile_arg = normalize_profile_name(task.assignee)
+            if not profile_exists(profile_arg):
+                result.skipped_nonspawnable.append(task.id)
+                continue
+        except Exception:
+            profile_arg = task.assignee
+        if dry_run:
+            result.spawned.append((task.id, task.assignee or "", ""))
+            spawned += 1
+            continue
+        claimed = provider.claim_task(task.id, ttl_seconds=kb.DEFAULT_CLAIM_TTL_SECONDS)
+        if claimed is None:
+            continue
+        workspace = str(claimed.workspace)
+        env = dict(os.environ)
+        env["HERMES_KANBAN_PROVIDER"] = "crosscut"
+        env["HERMES_KANBAN_BOARD"] = board
+        if isinstance(provider, CrossCutKanbanCliProvider):
+            env["CROSSCUT_KANBAN_BACKEND_ID"] = provider.backend_id
+        env["HERMES_KANBAN_TASK"] = claimed.task.id
+        env["HERMES_KANBAN_WORKSPACE"] = workspace
+        env["HERMES_PROFILE"] = profile_arg
+        if claimed.task.tenant:
+            env["HERMES_TENANT"] = claimed.task.tenant
+        worker_python = os.environ.get("HERMES_CROSSCUT_WORKER_PYTHON") or sys.executable
+        cmd = [
+            worker_python,
+            "-m", "hermes_cli.main",
+            "-p", profile_arg,
+            "--skills", "kanban-worker",
+        ]
+        if claimed.task.skills:
+            for sk in claimed.task.skills:
+                if sk and sk != "kanban-worker":
+                    cmd.extend(["--skills", sk])
+        cmd.extend(["chat", "-q", f"work kanban task {claimed.task.id}"])
+        log_dir = kb.worker_logs_dir(board=board)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{claimed.task.id}.log"
+        kb._rotate_worker_log(log_path, kb.DEFAULT_LOG_ROTATE_BYTES)
+        log_f = open(log_path, "ab")
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            log_f.close()
+            provider.block_task(
+                claimed.task.id,
+                reason=f"spawn failed: {exc}",
+                expected_run_id=None,
+            )
+            result.auto_blocked.append(claimed.task.id)
+            continue
+        result.spawned.append((claimed.task.id, claimed.task.assignee or "", workspace))
+        spawned += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1687,14 +1774,15 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
     if _provider_is_crosscut():
-        return _reject_crosscut_unsupported("dispatch")
-    with kb.connect() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-        )
+        res = _crosscut_dispatch_once(args)
+    else:
+        with kb.connect() as conn:
+            res = kb.dispatch_once(
+                conn,
+                dry_run=args.dry_run,
+                max_spawn=args.max,
+                failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            )
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
