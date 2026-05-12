@@ -712,6 +712,13 @@ workers spawned by the dispatcher drive it via a dedicated `kanban_*`
 toolset so their schema footprint is zero when they're not inside a
 kanban task.
 
+Storage note: SQLite remains the default/oracle backend. The CLI, dispatcher,
+and worker tools now route through a provider seam so a process can opt into
+a specialized backend via `HERMES_KANBAN_PROVIDER`; do not treat this as a
+global migration. Non-SQLite providers must be promoted one board at a time
+with a SQLite backup, provider-class verification, disposable smoke, live
+canary, and rollback check.
+
 - **CLI:** `hermes_cli/kanban.py` wires `hermes kanban` with verbs
   `init`, `create`, `list` (alias `ls`), `show`, `assign`, `link`,
   `unlink`, `comment`, `complete`, `block`, `unblock`, `archive`,

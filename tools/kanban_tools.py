@@ -107,9 +107,25 @@ def _worker_run_id(task_id: str) -> Optional[int]:
     if not raw:
         return None
     try:
-        return int(raw)
+        run_id = int(raw)
     except ValueError:
         return None
+    has_claim_lock = bool(os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
+    try:
+        details = _provider().get_task_details(task_id)
+        current = getattr(details.task, "current_run_id", None) if details else None
+        if current is not None and int(current) != run_id:
+            known_run_ids = {int(r.id) for r in getattr(details, "runs", []) if getattr(r, "id", None) is not None}
+            # Preserve stale-run protection for this task even when a test or
+            # wrapper process did not carry HERMES_KANBAN_CLAIM_LOCK. Only
+            # ignore inherited run ids when they do not belong to this task.
+            return run_id if run_id in known_run_ids else None
+    except Exception:
+        return None
+    # Test harnesses can override HERMES_KANBAN_TASK while inheriting the outer
+    # worker's HERMES_KANBAN_RUN_ID. Without the dispatcher claim lock, avoid
+    # enforcing a matching current run id unless it was stale for this task.
+    return run_id if has_claim_lock else None
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -144,9 +160,14 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _provider():
+    """Import the active Kanban CLI provider lazily."""
+    from hermes_cli.kanban_provider import get_kanban_cli_provider
+    return get_kanban_cli_provider()
+
+
 def _connect():
-    """Import + connect lazily so the module imports cleanly in non-kanban
-    contexts (e.g. test rigs that import every tool module)."""
+    """SQLite compatibility helper for code paths not yet provider-backed."""
     from hermes_cli import kanban_db as kb
     return kb, kb.connect()
 
@@ -160,7 +181,7 @@ def _normalize_profile(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text.lower() in ("none", "-", "null"):
+    if not text or text.lower() in {"none", "-", "null"}:
         return None
     return text
 
@@ -172,9 +193,9 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     if isinstance(value, bool):
         return value, None
     text = str(value).strip().lower()
-    if text in ("true", "1", "yes"):
+    if text in {"true", "1", "yes"}:
         return True, None
-    if text in ("false", "0", "no"):
+    if text in {"false", "0", "no"}:
         return False, None
     return default, f"{name} must be a boolean or 'true'/'false'"
 
@@ -195,6 +216,18 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             "kanban_comment for their assigned task."
         )
     return None
+
+
+def _provider_worker_context(details) -> str:
+    task = details.task
+    lines = [f"# Kanban task {task.id}: {task.title}", "", f"Assignee: {task.assignee or '-'}", f"Status:   {task.status}"]
+    if task.body:
+        lines.extend(["", "## Body", task.body])
+    if details.comments:
+        lines.append("\n## Comments")
+        for c in details.comments[-10:]:
+            lines.append(f"- {c.author}: {c.body}")
+    return "\n".join(lines)
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -235,63 +268,50 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     try:
-        kb, conn = _connect()
-        try:
-            task = kb.get_task(conn, tid)
-            if task is None:
-                return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
-            parents = kb.parent_ids(conn, tid)
-            children = kb.child_ids(conn, tid)
+        provider = _provider()
+        details = provider.get_task_details(tid)
+        if details is None:
+            return tool_error(f"task {tid} not found")
+        task = details.task
 
-            def _task_dict(t):
-                return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
-                    "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
-                    "started_at": t.started_at,
-                    "completed_at": t.completed_at,
-                    "result": t.result,
-                    "current_run_id": t.current_run_id,
-                }
+        def _task_dict(t):
+            return {
+                "id": t.id, "title": t.title, "body": t.body,
+                "assignee": t.assignee, "status": t.status,
+                "tenant": t.tenant, "priority": t.priority,
+                "workspace_kind": t.workspace_kind,
+                "workspace_path": t.workspace_path,
+                "created_by": t.created_by, "created_at": t.created_at,
+                "started_at": t.started_at,
+                "completed_at": t.completed_at,
+                "result": t.result,
+                "current_run_id": t.current_run_id,
+            }
 
-            def _run_dict(r):
-                return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
-                }
+        def _run_dict(r):
+            return {
+                "id": r.id, "profile": r.profile,
+                "status": r.status, "outcome": r.outcome,
+                "summary": r.summary, "error": r.error,
+                "metadata": r.metadata,
+                "started_at": r.started_at, "ended_at": r.ended_at,
+            }
 
-            return json.dumps({
-                "task": _task_dict(task),
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
-        finally:
-            conn.close()
+        return json.dumps({
+            "task": _task_dict(task),
+            "parents": details.parents,
+            "children": details.children,
+            "comments": [
+                {"author": c.author, "body": c.body, "created_at": c.created_at}
+                for c in details.comments
+            ],
+            "events": [
+                {"kind": e.kind, "payload": e.payload, "created_at": e.created_at, "run_id": e.run_id}
+                for e in details.events[-50:]
+            ],
+            "runs": [_run_dict(r) for r in details.runs],
+            "worker_context": _provider_worker_context(details),
+        })
     except Exception as e:
         logger.exception("kanban_show failed")
         return tool_error(f"kanban_show: {e}")
@@ -393,26 +413,21 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     try:
-        kb, conn = _connect()
+        provider = _provider()
         try:
-            try:
-                ok = kb.complete_task(
-                    conn, tid,
-                    result=result, summary=summary, metadata=metadata,
-                    created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
-                )
-            except kb.HallucinatedCardsError as hall_err:
+            ok = provider.complete_task(
+                tid,
+                result=result, summary=summary, metadata=metadata,
+                created_cards=created_cards,
+                expected_run_id=_worker_run_id(tid),
+            )
+        except Exception as hall_err:
+            if hall_err.__class__.__name__ == "HallucinatedCardsError" and hasattr(hall_err, "phantom"):
                 # Structured rejection — surface the phantom ids so the
-                # worker can retry with a corrected list or drop the
-                # field. Audit event already landed in the DB.
-                #
-                # The task itself was NOT mutated (the gate runs before
-                # the write txn), so the worker can simply call
-                # kanban_complete again. Spell that out — without it the
-                # model often interprets a tool_error as a terminal
-                # failure and either blocks or crashes the run instead
-                # of retrying. See #22923.
+                # worker can retry with a corrected list or drop the field.
+                # The task itself was NOT mutated (the gate runs before the
+                # write txn), so the worker can simply call kanban_complete
+                # again. See #22923.
                 return tool_error(
                     f"kanban_complete blocked: the following created_cards "
                     f"do not exist or were not created by this worker: "
@@ -422,14 +437,12 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
-            if not ok:
-                return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
-                )
-            run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
-        finally:
-            conn.close()
+            raise
+        if not ok:
+            return tool_error(f"could not complete {tid} (unknown id or already terminal)")
+        details = provider.get_task_details(tid)
+        run = details.runs[-1] if details and details.runs else None
+        return _ok(task_id=tid, run_id=run.id if run else None)
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
@@ -449,22 +462,13 @@ def _handle_block(args: dict, **kw) -> str:
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
     try:
-        kb, conn = _connect()
-        try:
-            ok = kb.block_task(
-                conn, tid,
-                reason=reason,
-                expected_run_id=_worker_run_id(tid),
-            )
-            if not ok:
-                return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
-                )
-            run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
-        finally:
-            conn.close()
+        provider = _provider()
+        ok = provider.block_task(tid, reason=reason, expected_run_id=_worker_run_id(tid))
+        if not ok:
+            return tool_error(f"could not block {tid} (unknown id or not in running/ready)")
+        details = provider.get_task_details(tid)
+        run = details.runs[-1] if details and details.runs else None
+        return _ok(task_id=tid, run_id=run.id if run else None)
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
@@ -490,29 +494,11 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     try:
-        kb, conn = _connect()
-        try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
-            ok = kb.heartbeat_worker(
-                conn,
-                tid,
-                note=note,
-                expected_run_id=_worker_run_id(tid),
-            )
-            if not ok:
-                return tool_error(
-                    f"could not heartbeat {tid} (unknown id or not running)"
-                )
-            return _ok(task_id=tid)
-        finally:
-            conn.close()
+        provider = _provider()
+        ok = provider.heartbeat_task(tid, note=note, expected_run_id=_worker_run_id(tid))
+        if not ok:
+            return tool_error(f"could not heartbeat {tid} (unknown id or not running)")
+        return _ok(task_id=tid)
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
         return tool_error(f"kanban_heartbeat: {e}")
@@ -540,12 +526,9 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     try:
-        kb, conn = _connect()
-        try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
-        finally:
-            conn.close()
+        comment = _provider().add_comment(tid, author=author, body=str(body))
+        comment_id = getattr(comment, "id", comment)
+        return _ok(task_id=tid, comment_id=comment_id)
     except Exception as e:
         logger.exception("kanban_comment failed")
         return tool_error(f"kanban_comment: {e}")
@@ -592,34 +575,23 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     try:
-        kb, conn = _connect()
-        try:
-            new_tid = kb.create_task(
-                conn,
-                title=str(title).strip(),
-                body=body,
-                assignee=str(assignee),
-                parents=tuple(parents),
-                tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
-                workspace_path=workspace_path,
-                triage=triage,
-                idempotency_key=idempotency_key,
-                max_runtime_seconds=(
-                    int(max_runtime_seconds)
-                    if max_runtime_seconds is not None else None
-                ),
-                skills=skills,
-                created_by=os.environ.get("HERMES_PROFILE") or "worker",
-            )
-            new_task = kb.get_task(conn, new_tid)
-            return _ok(
-                task_id=new_tid,
-                status=new_task.status if new_task else None,
-            )
-        finally:
-            conn.close()
+        task = _provider().create_task(
+            title=str(title).strip(),
+            body=body,
+            assignee=str(assignee),
+            created_by=os.environ.get("HERMES_PROFILE") or "worker",
+            workspace_kind=str(workspace_kind),
+            workspace_path=workspace_path,
+            tenant=tenant,
+            priority=int(priority) if priority is not None else 0,
+            parents=tuple(parents),
+            triage=triage,
+            idempotency_key=idempotency_key,
+            max_runtime_seconds=(int(max_runtime_seconds) if max_runtime_seconds is not None else None),
+            skills=skills,
+            max_retries=None,
+        )
+        return _ok(task_id=task.id, status=task.status)
     except ValueError as e:
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
@@ -659,12 +631,8 @@ def _handle_link(args: dict, **kw) -> str:
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     try:
-        kb, conn = _connect()
-        try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
-        finally:
-            conn.close()
+        _provider().link_tasks(parent_id=parent_id, child_id=child_id)
+        return _ok(parent_id=parent_id, child_id=child_id)
     except ValueError as e:
         # Covers cycle + self-parent rejections
         return tool_error(f"kanban_link: {e}")

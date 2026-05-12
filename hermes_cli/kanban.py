@@ -1,8 +1,9 @@
 """CLI for the Hermes Kanban board — ``hermes kanban …`` subcommand.
 
 Exposes the full 15-verb surface documented in the design spec
-(``docs/hermes-kanban-v1-spec.pdf``).  All DB work is delegated to
-``kanban_db``.  This module adds:
+(``docs/hermes-kanban-v1-spec.pdf``).  Core task-level DB work is delegated
+through ``kanban_provider`` so the CLI owns argument parsing/output shape while
+storage implementations stay behind a contract.  This module adds:
 
   * Argparse subcommand construction (``build_parser``).
   * Argument dispatch (``kanban_command``).
@@ -18,12 +19,14 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_provider import CrossCutKanbanCliProvider, get_kanban_cli_provider
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +85,7 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     if not value:
         return ("scratch", None)
     v = value.strip()
-    if v in ("scratch", "worktree"):
+    if v in {"scratch", "worktree"}:
         return (v, None)
     if v.startswith("dir:"):
         path = v[len("dir:"):].strip()
@@ -510,6 +513,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("--chat-id", required=True)
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
+    p_nsub.add_argument(
+        "--notifier-profile", default=None,
+        help="Profile gateway that owns/delivers this subscription (default: active profile)",
+    )
 
     p_nlist = sub.add_parser(
         "notify-list",
@@ -628,6 +635,7 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     Returns a shell-style exit code (0 on success, non-zero on error).
     """
+    provider = get_kanban_cli_provider()
     action = getattr(args, "kanban_action", None)
     if not action:
         # No subaction given: print help via the stored parser reference.
@@ -648,6 +656,16 @@ def kanban_command(args: argparse.Namespace) -> int:
     # keeps the patch small and inherits the exact same resolution the
     # dispatcher uses for workers — consistency is a feature here.
     board_override = getattr(args, "board", None)
+    prev_board_env = os.environ.get("HERMES_KANBAN_BOARD")
+    restore_board_env = False
+
+    def _restore_board_env() -> None:
+        if not restore_board_env:
+            return
+        if prev_board_env is None:
+            os.environ.pop("HERMES_KANBAN_BOARD", None)
+        else:
+            os.environ["HERMES_KANBAN_BOARD"] = prev_board_env
     if board_override:
         try:
             normed = kb._normalize_board_slug(board_override)
@@ -659,7 +677,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         # Boards other than 'default' must already exist — typoed slugs
         # would otherwise silently create an empty board.
-        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+        if normed != kb.DEFAULT_BOARD and not provider.board_exists(normed):
             print(
                 f"kanban: board {normed!r} does not exist. "
                 f"Create it with `hermes kanban boards create {normed}`.",
@@ -667,12 +685,16 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
             return 1
         os.environ["HERMES_KANBAN_BOARD"] = normed
+        restore_board_env = True
 
     # Boards management doesn't touch the DB at all — dispatch early so
     # fresh installs that haven't initialized any DB can still use
     # `hermes kanban boards create …`.
     if action == "boards":
-        return _dispatch_boards(args)
+        try:
+            return _dispatch_boards(args)
+        finally:
+            _restore_board_env()
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -682,9 +704,10 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     try:
-        kb.init_db()
+        provider.init_db()
     except Exception as exc:
         print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
+        _restore_board_env()
         return 1
 
     handlers = {
@@ -726,17 +749,35 @@ def kanban_command(args: argparse.Namespace) -> int:
     handler = handlers.get(action)
     if not handler:
         print(f"kanban: unknown action {action!r}", file=sys.stderr)
+        _restore_board_env()
         return 2
     try:
         return int(handler(args) or 0)
     except (ValueError, RuntimeError) as exc:
         print(f"kanban: {exc}", file=sys.stderr)
+        _restore_board_env()
         return 1
+    finally:
+        _restore_board_env()
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _provider_is_crosscut(provider=None) -> bool:
+    provider = provider or get_kanban_cli_provider()
+    return isinstance(provider, CrossCutKanbanCliProvider)
+
+
+def _reject_crosscut_unsupported(action: str) -> int:
+    print(
+        f"hermes kanban {action}: unsupported with HERMES_KANBAN_PROVIDER=crosscut; "
+        "this command still depends on SQLite-only board internals.",
+        file=sys.stderr,
+    )
+    return 2
+
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
@@ -749,6 +790,98 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+def _crosscut_dispatch_once(args: argparse.Namespace) -> kb.DispatchResult:
+    """Dispatch one tick against the CrossCut/Postgres Kanban provider."""
+    provider = get_kanban_cli_provider()
+    result = kb.DispatchResult()
+    max_spawn = getattr(args, "max", None)
+    dry_run = bool(getattr(args, "dry_run", False))
+    board = os.environ.get("HERMES_KANBAN_BOARD") or kb.get_current_board()
+
+    tasks = sorted(
+        provider.list_tasks(assignee=None, status="ready", tenant=None, include_archived=False),
+        key=lambda t: (-int(t.priority or 0), int(t.created_at or 0), t.id),
+    )
+    spawned = 0
+    for task in tasks:
+        if max_spawn is not None and spawned >= int(max_spawn):
+            break
+        if not task.assignee:
+            result.skipped_unassigned.append(task.id)
+            continue
+        try:
+            from hermes_cli.profiles import normalize_profile_name, profile_exists
+            profile_arg = normalize_profile_name(task.assignee)
+            if profile_arg == "default":
+                result.skipped_nonspawnable.append(task.id)
+                continue
+            if not profile_exists(profile_arg):
+                result.skipped_nonspawnable.append(task.id)
+                continue
+        except Exception:
+            profile_arg = task.assignee
+            if profile_arg == "default":
+                result.skipped_nonspawnable.append(task.id)
+                continue
+        if dry_run:
+            result.spawned.append((task.id, task.assignee or "", ""))
+            spawned += 1
+            continue
+        claimed = provider.claim_task(task.id, ttl_seconds=kb.DEFAULT_CLAIM_TTL_SECONDS)
+        if claimed is None:
+            continue
+        workspace = str(claimed.workspace)
+        env = dict(os.environ)
+        env["HERMES_KANBAN_PROVIDER"] = "crosscut"
+        env["HERMES_KANBAN_BOARD"] = board
+        if isinstance(provider, CrossCutKanbanCliProvider):
+            env["CROSSCUT_KANBAN_BACKEND_ID"] = provider.backend_id
+        env["HERMES_KANBAN_TASK"] = claimed.task.id
+        env["HERMES_KANBAN_WORKSPACE"] = workspace
+        env["HERMES_PROFILE"] = profile_arg
+        if claimed.task.tenant:
+            env["HERMES_TENANT"] = claimed.task.tenant
+        worker_python = os.environ.get("HERMES_CROSSCUT_WORKER_PYTHON") or sys.executable
+        cmd = [
+            worker_python,
+            "-m", "hermes_cli.main",
+            "-p", profile_arg,
+            "--skills", "kanban-worker",
+        ]
+        if claimed.task.skills:
+            for sk in claimed.task.skills:
+                if sk and sk != "kanban-worker":
+                    cmd.extend(["--skills", sk])
+        cmd.extend(["chat", "-q", f"work kanban task {claimed.task.id}"])
+        log_dir = kb.worker_logs_dir(board=board)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{claimed.task.id}.log"
+        kb._rotate_worker_log(log_path, kb.DEFAULT_LOG_ROTATE_BYTES)
+        log_f = open(log_path, "ab")
+        try:
+            subprocess.Popen(
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            log_f.close()
+            provider.block_task(
+                claimed.task.id,
+                reason=f"spawn failed: {exc}",
+                expected_run_id=None,
+            )
+            result.auto_blocked.append(claimed.task.id)
+            continue
+        result.spawned.append((claimed.task.id, claimed.task.assignee or "", workspace))
+        spawned += 1
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -765,15 +898,15 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     can still run ``boards create`` / ``boards list``.
     """
     sub = getattr(args, "boards_action", None) or "list"
-    if sub in ("list", "ls"):
+    if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
-    if sub in ("create", "new"):
+    if sub in {"create", "new"}:
         return _cmd_boards_create(args)
-    if sub in ("rm", "remove", "delete"):
+    if sub in {"rm", "remove", "delete"}:
         return _cmd_boards_rm(args)
-    if sub in ("switch", "use"):
+    if sub in {"switch", "use"}:
         return _cmd_boards_switch(args)
-    if sub in ("show", "current"):
+    if sub in {"show", "current"}:
         return _cmd_boards_show(args)
     if sub == "rename":
         return _cmd_boards_rename(args)
@@ -956,7 +1089,8 @@ def _parse_duration(val) -> Optional[int]:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    path = kb.init_db()
+    provider = get_kanban_cli_provider()
+    path = provider.init_db()
     print(f"Kanban DB initialized at {path}")
     print()
     # Enumerate profiles on disk so the user knows what assignees are
@@ -965,7 +1099,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     # dispatcher doesn't need to enumerate — we just pass the name
     # through to `hermes -p <name>`.
     try:
-        profiles = kb.list_profiles_on_disk()
+        profiles = provider.list_profiles_on_disk()
     except Exception:
         profiles = []
     if profiles:
@@ -989,13 +1123,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        ok = kb.heartbeat_worker(
-            conn,
-            args.task_id,
-            note=getattr(args, "note", None),
-            expected_run_id=_worker_run_id_for(args.task_id),
-        )
+    provider = get_kanban_cli_provider()
+    ok = provider.heartbeat_task(
+        args.task_id,
+        note=getattr(args, "note", None),
+        expected_run_id=_worker_run_id_for(args.task_id),
+    )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
         return 1
@@ -1037,25 +1170,24 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-        )
-        task = kb.get_task(conn, task_id)
+    provider = get_kanban_cli_provider()
+    task = provider.create_task(
+        title=args.title,
+        body=args.body,
+        assignee=args.assignee,
+        created_by=args.created_by or _profile_author(),
+        workspace_kind=ws_kind,
+        workspace_path=ws_path,
+        tenant=args.tenant,
+        priority=args.priority,
+        parents=tuple(args.parent or ()),
+        triage=bool(getattr(args, "triage", False)),
+        idempotency_key=getattr(args, "idempotency_key", None),
+        max_runtime_seconds=max_runtime,
+        skills=getattr(args, "skills", None) or None,
+        max_retries=max_retries,
+    )
+    task_id = task.id
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1079,17 +1211,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
-    with kb.connect() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
-        tasks = kb.list_tasks(
-            conn,
-            assignee=assignee,
-            status=args.status,
-            tenant=args.tenant,
-            include_archived=args.archived,
-        )
+    provider = get_kanban_cli_provider()
+    tasks = provider.list_tasks(
+        assignee=assignee,
+        status=args.status,
+        tenant=args.tenant,
+        include_archived=args.archived,
+    )
     if getattr(args, "json", False):
         print(json.dumps([_task_to_dict(t) for t in tasks], indent=2, ensure_ascii=False))
         return 0
@@ -1097,11 +1225,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     # which one they're looking at in the list header. Single-board users
     # never see this — the feature stays invisible until you opt in.
     try:
-        all_boards = kb.list_boards(include_archived=False)
+        all_boards = provider.list_boards(include_archived=False)
     except Exception:
         all_boards = []
     if len(all_boards) > 1:
-        current = kb.get_current_board()
+        current = provider.get_current_board()
         other_count = len(all_boards) - 1
         print(
             f"Board: {current} "
@@ -1117,21 +1245,18 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        task = kb.get_task(conn, args.task_id)
-        if not task:
-            print(f"no such task: {args.task_id}", file=sys.stderr)
-            return 1
-        comments = kb.list_comments(conn, args.task_id)
-        events = kb.list_events(conn, args.task_id)
-        parents = kb.parent_ids(conn, args.task_id)
-        children = kb.child_ids(conn, args.task_id)
-        runs = kb.list_runs(conn, args.task_id)
-        # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
-        # ``tasks.result`` is left NULL unless the caller explicitly passed
-        # ``result=``. Surfacing the latest summary here keeps ``show`` from
-        # looking like a no-op when the worker actually did real work.
-        latest_summary = kb.latest_summary(conn, args.task_id)
+    provider = get_kanban_cli_provider()
+    details = provider.get_task_details(args.task_id)
+    if details is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    task = details.task
+    comments = details.comments
+    events = details.events
+    parents = details.parents
+    children = details.children
+    runs = details.runs
+    latest_summary = details.latest_summary
 
     if getattr(args, "json", False):
         payload = {
@@ -1278,7 +1403,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_assign(args: argparse.Namespace) -> int:
-    profile = None if args.profile.lower() in ("none", "-", "null") else args.profile
+    profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
@@ -1289,11 +1414,11 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        ok = kb.reclaim_task(
-            conn, args.task_id,
-            reason=getattr(args, "reason", None),
-        )
+    provider = get_kanban_cli_provider()
+    ok = provider.reclaim_task(
+        args.task_id,
+        reason=getattr(args, "reason", None),
+    )
     if not ok:
         print(
             f"cannot reclaim {args.task_id} (not running or unknown id)",
@@ -1305,7 +1430,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
-    profile = None if args.profile.lower() in ("none", "-", "null") else args.profile
+    profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
@@ -1331,6 +1456,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     """List active diagnostics on the board. Wraps the same rule engine
     the dashboard uses, so CLI output matches what the UI shows.
     """
+    if _provider_is_crosscut():
+        return _reject_crosscut_unsupported("diagnostics")
     from hermes_cli import kanban_diagnostics as kd
 
     with kb.connect() as conn:
@@ -1450,15 +1577,15 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
+    provider = get_kanban_cli_provider()
+    provider.link_tasks(args.parent_id, args.child_id)
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+    provider = get_kanban_cli_provider()
+    ok = provider.unlink_tasks(args.parent_id, args.child_id)
     if not ok:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
         return 1
@@ -1467,32 +1594,30 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
-        if task is None:
-            # Report why
-            existing = kb.get_task(conn, args.task_id)
-            if existing is None:
-                print(f"no such task: {args.task_id}", file=sys.stderr)
-                return 1
-            print(
-                f"cannot claim {args.task_id}: status={existing.status} "
-                f"lock={existing.claim_lock or '(none)'}",
-                file=sys.stderr,
-            )
+    provider = get_kanban_cli_provider()
+    claim = provider.claim_task(args.task_id, ttl_seconds=args.ttl)
+    if claim is None:
+        details = provider.get_task_details(args.task_id)
+        if details is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
             return 1
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
-    print(f"Claimed {task.id}")
-    print(f"Workspace: {workspace}")
+        existing = details.task
+        print(
+            f"cannot claim {args.task_id}: status={existing.status} "
+            f"lock={existing.claim_lock or '(none)'}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Claimed {claim.task.id}")
+    print(f"Workspace: {claim.workspace}")
     return 0
 
 
 def _cmd_comment(args: argparse.Namespace) -> int:
     body = " ".join(args.text).strip()
     author = args.author or _profile_author()
-    with kb.connect() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+    provider = get_kanban_cli_provider()
+    provider.add_comment(args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -1538,19 +1663,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     failed: list[str] = []
-    with kb.connect() as conn:
-        for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
-                failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
-            else:
-                print(f"Completed {tid}")
+    provider = get_kanban_cli_provider()
+    for tid in ids:
+        if not provider.complete_task(
+            tid,
+            result=args.result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=None,
+            expected_run_id=_worker_run_id_for(tid),
+        ):
+            failed.append(tid)
+            print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+        else:
+            print(f"Completed {tid}")
     return 0 if not failed else 1
 
 
@@ -1565,19 +1691,18 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
-    with kb.connect() as conn:
-        if not kb.edit_completed_task_result(
-            conn,
-            args.task_id,
-            result=args.result,
-            summary=getattr(args, "summary", None),
-            metadata=metadata,
-        ):
-            print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
-                file=sys.stderr,
-            )
-            return 1
+    provider = get_kanban_cli_provider()
+    if not provider.edit_completed_task_result(
+        args.task_id,
+        result=args.result,
+        summary=getattr(args, "summary", None),
+        metadata=metadata,
+    ):
+        print(
+            f"cannot edit {args.task_id} (unknown id or task is not done)",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Edited {args.task_id}")
     return 0
 
@@ -1587,20 +1712,19 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
-    with kb.connect() as conn:
-        for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
-                failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
-            else:
-                print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+    provider = get_kanban_cli_provider()
+    for tid in ids:
+        if reason:
+            provider.add_comment(tid, author, f"BLOCKED: {reason}")
+        if not provider.block_task(
+            tid,
+            reason=reason,
+            expected_run_id=_worker_run_id_for(tid),
+        ):
+            failed.append(tid)
+            print(f"cannot block {tid}", file=sys.stderr)
+        else:
+            print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -1610,13 +1734,13 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     failed: list[str] = []
-    with kb.connect() as conn:
-        for tid in ids:
-            if not kb.unblock_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked?)", file=sys.stderr)
-            else:
-                print(f"Unblocked {tid}")
+    provider = get_kanban_cli_provider()
+    for tid in ids:
+        if not provider.unblock_task(tid):
+            failed.append(tid)
+            print(f"cannot unblock {tid} (not blocked?)", file=sys.stderr)
+        else:
+            print(f"Unblocked {tid}")
     return 0 if not failed else 1
 
 
@@ -1626,13 +1750,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         print("at least one task_id is required", file=sys.stderr)
         return 1
     failed: list[str] = []
-    with kb.connect() as conn:
-        for tid in ids:
-            if not kb.archive_task(conn, tid):
-                failed.append(tid)
-                print(f"cannot archive {tid}", file=sys.stderr)
-            else:
-                print(f"Archived {tid}")
+    provider = get_kanban_cli_provider()
+    for tid in ids:
+        if not provider.archive_task(tid):
+            failed.append(tid)
+            print(f"cannot archive {tid}", file=sys.stderr)
+        else:
+            print(f"Archived {tid}")
     return 0 if not failed else 1
 
 
@@ -1655,13 +1779,16 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-        )
+    if _provider_is_crosscut():
+        res = _crosscut_dispatch_once(args)
+    else:
+        with kb.connect() as conn:
+            res = kb.dispatch_once(
+                conn,
+                dry_run=args.dry_run,
+                max_spawn=args.max,
+                failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            )
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -1703,6 +1830,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
+    if _provider_is_crosscut():
+        return _reject_crosscut_unsupported("daemon")
     """Deprecated — the dispatcher now runs inside the gateway.
 
     Left in as a stub so users with the old command in scripts/systemd
@@ -1845,6 +1974,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Live-stream task_events to the terminal."""
+    if _provider_is_crosscut():
+        return _reject_crosscut_unsupported("watch")
     kinds = (
         {k.strip() for k in args.kinds.split(",") if k.strip()}
         if args.kinds else None
@@ -1893,8 +2024,8 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        stats = kb.board_stats(conn)
+    provider = get_kanban_cli_provider()
+    stats = provider.board_stats()
     if getattr(args, "json", False):
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
@@ -1921,6 +2052,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id, user_id=args.user_id,
+            notifier_profile=args.notifier_profile or _profile_author(),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
@@ -1939,8 +2071,9 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
         return 0
     for s in subs:
         thr = f":{s['thread_id']}" if s.get("thread_id") else ""
+        owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
-              f"  (since event {s['last_event_id']})")
+              f"  (since event {s['last_event_id']}){owner}")
     return 0
 
 
@@ -2071,19 +2204,18 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                 "reason": outcome.reason,
                 "new_title": outcome.new_title,
             }))
+        elif outcome.ok:
+            title_suffix = (
+                f" — retitled: {outcome.new_title!r}"
+                if outcome.new_title
+                else ""
+            )
+            print(f"Specified {outcome.task_id} → todo{title_suffix}")
         else:
-            if outcome.ok:
-                title_suffix = (
-                    f" — retitled: {outcome.new_title!r}"
-                    if outcome.new_title
-                    else ""
-                )
-                print(f"Specified {outcome.task_id} → todo{title_suffix}")
-            else:
-                print(
-                    f"kanban: specify {outcome.task_id}: {outcome.reason}",
-                    file=sys.stderr,
-                )
+            print(
+                f"kanban: specify {outcome.task_id}: {outcome.reason}",
+                file=sys.stderr,
+            )
     if not all_flag:
         return 0 if ok_count == 1 else 1
     # --all: succeed if at least one promotion landed; exit 1 only when
@@ -2206,7 +2338,7 @@ def run_slash(rest: str) -> str:
         out = buf_out.getvalue().rstrip()
         err = buf_err.getvalue().rstrip()
         # Help dump (exit 0) → return the captured help text directly.
-        if exc.code in (0, None) and out:
+        if exc.code in {0, None} and out:
             return out
         body = err or out
         return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"

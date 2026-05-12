@@ -10,6 +10,8 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
+SQLite is the default and supported storage backend. Advanced/local deployments may select an alternate provider for a process with `HERMES_KANBAN_PROVIDER`, but provider promotion should be board-scoped and reversible. The CrossCut/PostgreSQL provider is experimental: use it only for approved canaries with a SQLite backup and a verified rollback path.
+
 ### Two surfaces: the model talks through tools, you talk through the CLI
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
@@ -68,6 +70,36 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Worker-side `git worktree add` creates it.
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Storage providers
+
+By default Kanban stores each board in SQLite (`~/.hermes/kanban.db` for the default board, or `~/.hermes/kanban/boards/<slug>/kanban.db` for named boards). This remains the safest default and the rollback target.
+
+The CLI, dispatcher, and worker tools route through a provider seam so specialized deployments can opt into another backend for a specific process. Provider selection is intentionally environment-scoped, not a silent global migration. The CrossCut provider also needs the optional runtime deps installed in the Hermes environment that runs workers:
+
+```bash
+python -m pip install 'hermes-agent[crosscut]'
+```
+
+```bash
+# Default: SQLite
+unset HERMES_KANBAN_PROVIDER
+
+# Experimental CrossCut/PostgreSQL provider for an approved board only
+export HERMES_KANBAN_PROVIDER=crosscut
+export CROSSCUT_DATABASE_URL=postgresql://...
+export CROSSCUT_KANBAN_BACKEND_ID=<backend-id>
+export HERMES_KANBAN_BOARD=<board>
+```
+
+Promotion checklist for non-SQLite providers:
+
+1. Back up the SQLite board database.
+2. Prove provider selection from the same shell/profile that will run Hermes.
+3. Run a disposable smoke before touching a recurring board.
+4. Promote one board at a time; do not flip the global default first.
+5. Verify list/show/create/comment/claim/heartbeat/complete/runs/archive.
+6. Unset provider env and verify SQLite readability before rollback writes.
 
 ## Boards (multi-project)
 
