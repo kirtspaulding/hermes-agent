@@ -63,11 +63,24 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
-_CROSSCUT_PROJECT_ROOT = Path("/home/vice/CrossCut/crosscut")
+_CROSSCUT_PROJECT_ROOT_ENV = "CROSSCUT_PROJECT_ROOT"
+
+
+def _crosscut_project_root() -> Path | None:
+    raw = os.getenv(_CROSSCUT_PROJECT_ROOT_ENV, "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
 
 
 def _ensure_crosscut_project_import_path() -> None:
-    root = str(_CROSSCUT_PROJECT_ROOT)
+    root_path = _crosscut_project_root()
+    if root_path is None:
+        return
+    if not root_path.is_dir():
+        logger.warning("Ignoring %s=%s because it is not a directory", _CROSSCUT_PROJECT_ROOT_ENV, root_path)
+        return
+    root = str(root_path)
     if root not in sys.path:
         sys.path.insert(0, root)
 

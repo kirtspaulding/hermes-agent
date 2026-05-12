@@ -369,6 +369,21 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
+
+    try:
+        from importlib.metadata import PackageNotFoundError, version as package_version
+
+        try:
+            mistral_version = package_version("mistralai")
+        except PackageNotFoundError:
+            mistral_version = None
+        if mistral_version == "2.4.6":
+            check_fail("mistralai 2.4.6 installed", "(quarantined malicious release)")
+            issues.append("Uninstall quarantined mistralai 2.4.6: python -m pip uninstall mistralai")
+        elif mistral_version:
+            check_ok(f"mistralai {mistral_version}", "(optional)")
+    except Exception as exc:
+        check_warn("mistralai quarantine check skipped", f"({exc})")
     
     # =========================================================================
     # Check: Configuration files

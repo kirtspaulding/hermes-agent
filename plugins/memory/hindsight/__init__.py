@@ -121,6 +121,32 @@ def _meets_minimum_version(actual: str | None, required: str) -> bool:
         return False
 
 
+def _is_hindsight_api_url_safe(url: str) -> bool:
+    """Return True if a Hindsight API URL is safe to probe.
+
+    Cloud URLs use the shared SSRF guard. Localhost is allowed for the
+    embedded/local Hindsight mode, but cloud metadata hosts remain blocked by
+    the shared guard when a non-loopback host is supplied.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        from tools.url_safety import is_safe_url
+        return bool(is_safe_url(url))
+    except Exception as exc:
+        logger.debug("Hindsight URL safety check failed for %s: %s", url, exc)
+        return False
+
+
 def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
                                  timeout: float = 5.0) -> str | None:
     """GET ``<api_url>/version`` and return the version string (or None on failure).
@@ -134,11 +160,20 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     if not api_url:
         return None
     url = api_url.rstrip("/") + "/version"
+    if not _is_hindsight_api_url_safe(url):
+        logger.warning("Blocked unsafe Hindsight API URL probe: %s", url)
+        return None
     req = urllib.request.Request(url)
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
+
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirectHandler)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with opener.open(req, timeout=timeout) as resp:  # noqa: S310
             payload = resp.read().decode("utf-8", errors="replace")
         data = json.loads(payload)
     except Exception as exc:
@@ -1059,31 +1094,18 @@ class HindsightMemoryProvider(MemoryProvider):
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
 
-        # Check client version and auto-upgrade if needed
+        # Check client version but do not mutate the runtime environment from
+        # inside an active session. Package upgrades are operator/package-manager
+        # actions, not plugin initialization side effects.
         try:
             from importlib.metadata import version as pkg_version
             from packaging.version import Version
             installed = pkg_version("hindsight-client")
             if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                               installed, _MIN_CLIENT_VERSION)
-                import shutil
-                import subprocess
-                import sys
-                uv_path = shutil.which("uv")
-                if uv_path:
-                    try:
-                        subprocess.run(
-                            [uv_path, "pip", "install", "--python", sys.executable,
-                             "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
-                        )
-                        logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                    except Exception as e:
-                        logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                       e, _MIN_CLIENT_VERSION)
-                else:
-                    logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
+                logger.warning(
+                    "hindsight-client %s is outdated (need >=%s). Run: pip install --upgrade 'hindsight-client>=%s'",
+                    installed, _MIN_CLIENT_VERSION, _MIN_CLIENT_VERSION,
+                )
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
