@@ -11855,9 +11855,14 @@ Examples:
         cmd_chat(args)
         return
 
-    # Execute the command
+    # Execute the command. Subcommand handlers may either call sys.exit
+    # themselves, return None for success, or return an integer process status.
+    # Preserve non-zero command return codes so wrappers/automation cannot treat
+    # explicit rejections as successful no-ops.
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if type(result) is int:
+            sys.exit(result)
     else:
         parser.print_help()
 

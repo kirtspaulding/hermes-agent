@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -3311,6 +3312,71 @@ def test_cli_daemon_without_force_prints_deprecation_exits_2(kanban_home, capsys
     err = capsys.readouterr().err
     assert "DEPRECATED" in err
     assert "hermes gateway start" in err
+
+
+def test_cli_main_preserves_kanban_daemon_rejection_exit_code(tmp_path):
+    """Process-level CLI wrappers must see daemon rejection as failure."""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path / ".hermes")
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    env.pop("HERMES_KANBAN_PROVIDER", None)
+    env.pop("CROSSCUT_KANBAN_BACKEND_ID", None)
+    env.pop("CROSSCUT_KANBAN_BOARD", None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "kanban", "daemon"],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    assert proc.returncode == 2
+    assert "DEPRECATED" in proc.stderr
+
+
+def test_crosscut_dispatch_skips_default_profile(monkeypatch):
+    """CrossCut provider dispatch must not spawn routine work on default."""
+    from hermes_cli import kanban as kb_cli
+
+    task = kb.Task(
+        id="t_default",
+        title="unsafe default",
+        body=None,
+        assignee="default",
+        status="ready",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+
+    class FakeProvider:
+        def list_tasks(self, *, assignee, status, tenant, include_archived):
+            return [task]
+
+    monkeypatch.setattr(kb_cli, "get_kanban_cli_provider", lambda: FakeProvider())
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda profile: True)
+
+    rc = kb_cli._crosscut_dispatch_once(argparse.Namespace(max=None, dry_run=True))
+    assert rc.spawned == []
+    assert rc.skipped_nonspawnable == ["t_default"]
+
+
+def test_crosscut_daemon_rejection_exits_2(monkeypatch, capsys):
+    """CrossCut provider daemon is explicitly unsupported and returns failure."""
+    from hermes_cli import kanban as kb_cli
+    monkeypatch.setattr(kb_cli, "_provider_is_crosscut", lambda: True)
+    ns = argparse.Namespace(
+        force=True, interval=60.0, max=None, failure_limit=3,
+        pidfile=None, verbose=False,
+    )
+    assert kb_cli._cmd_daemon(ns) == 2
+    assert "unsupported with HERMES_KANBAN_PROVIDER=crosscut" in capsys.readouterr().err
 
 
 def test_cli_daemon_help_marks_deprecated():

@@ -814,11 +814,17 @@ def _crosscut_dispatch_once(args: argparse.Namespace) -> kb.DispatchResult:
         try:
             from hermes_cli.profiles import normalize_profile_name, profile_exists
             profile_arg = normalize_profile_name(task.assignee)
+            if profile_arg == "default":
+                result.skipped_nonspawnable.append(task.id)
+                continue
             if not profile_exists(profile_arg):
                 result.skipped_nonspawnable.append(task.id)
                 continue
         except Exception:
             profile_arg = task.assignee
+            if profile_arg == "default":
+                result.skipped_nonspawnable.append(task.id)
+                continue
         if dry_run:
             result.spawned.append((task.id, task.assignee or "", ""))
             spawned += 1
