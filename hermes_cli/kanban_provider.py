@@ -119,6 +119,16 @@ class KanbanCliProvider(Protocol):
 
     def block_task(self, task_id: str, *, reason: Optional[str], expected_run_id: Optional[int]) -> bool: ...
 
+    def attach_worker_handoff(
+        self,
+        task_id: str,
+        *,
+        marker: str,
+        text: str,
+        final_response_chars: int,
+        run_id: Optional[int] = None,
+    ) -> bool: ...
+
     def unblock_task(self, task_id: str) -> bool: ...
 
     def archive_task(self, task_id: str) -> bool: ...
@@ -217,6 +227,10 @@ class SqliteKanbanCliProvider:
     def block_task(self, task_id: str, *, reason: Optional[str], expected_run_id: Optional[int]) -> bool:
         with kb.connect() as conn:
             return kb.block_task(conn, task_id, reason=reason, expected_run_id=expected_run_id)
+
+    def attach_worker_handoff(self, task_id: str, *, marker: str, text: str, final_response_chars: int, run_id: Optional[int] = None) -> bool:
+        with kb.connect() as conn:
+            return kb.attach_worker_handoff(conn, task_id, marker=marker, text=text, final_response_chars=final_response_chars, run_id=run_id)
 
     def unblock_task(self, task_id: str) -> bool:
         with kb.connect() as conn:
@@ -479,6 +493,65 @@ class CrossCutKanbanCliProvider:
         self.repo.create_event(_work_event_request("hermes_task_blocked", projection.work_item_id, {"task_id": task_id, "mapping_id": projection.mapping_id, "reason": reason}))
         return True
 
+    def attach_worker_handoff(self, task_id: str, *, marker: str, text: str, final_response_chars: int, run_id: Optional[int] = None) -> bool:
+        del run_id
+        projection = self._projection_for_task_id(task_id)
+        if projection is None:
+            return False
+        terminal_status = _crosscut_to_hermes_status(projection.status)
+        if terminal_status not in {"done", "blocked"}:
+            return False
+        block = (text or "").strip()
+        if not block:
+            return False
+        capture = _worker_handoff_capture(marker=marker, text=block, final_response_chars=final_response_chars)
+        details = self.repo.show_execution_task_details(projection.mapping_id)
+        runs = list(getattr(details, "runs", []) or [])
+        run = next(
+            (
+                r for r in reversed(runs)
+                if str(getattr(r, "status", "") or "") == "done"
+                or str(getattr(r, "outcome", "") or "") in {"done", "completed", "blocked"}
+            ),
+            None,
+        )
+        if run is None:
+            return False
+        metadata = dict(getattr(run, "metadata", None) or {})
+        existing = metadata.get("worker_handoff")
+        if isinstance(existing, dict) and existing.get("sha256") == capture["sha256"]:
+            return False
+        metadata["worker_handoff"] = capture
+        self.repo.create_or_update_execution_run(
+            _crosscut_request(
+                "CreateWorkExecutionRunRequest",
+                id=run.id,
+                mapping_id=projection.mapping_id,
+                external_run_id=getattr(run, "external_run_id", None),
+                profile=getattr(run, "profile", None),
+                status=getattr(run, "status", "done"),
+                outcome=getattr(run, "outcome", None),
+                summary=getattr(run, "summary", None),
+                error=getattr(run, "error", None),
+                started_at=getattr(run, "started_at", None),
+                ended_at=getattr(run, "ended_at", None),
+                metadata=metadata,
+            )
+        )
+        self.repo.create_event(
+            _work_event_request(
+                "hermes_task_worker_handoff_attached",
+                projection.work_item_id,
+                {
+                    "task_id": task_id,
+                    "mapping_id": projection.mapping_id,
+                    "terminal_status": terminal_status,
+                    "worker_handoff": capture,
+                },
+            )
+        )
+        return True
+
     def unblock_task(self, task_id: str) -> bool:
         projection = self._projection_for_task_id(task_id)
         if projection is None or _crosscut_to_hermes_status(projection.status) != "blocked":
@@ -605,7 +678,7 @@ class CrossCutKanbanCliProvider:
             ended_at=ended,
             outcome=r.outcome,
             summary=r.summary,
-            metadata=None,
+            metadata=getattr(r, "metadata", None),
             error=r.error,
         )
 
@@ -651,6 +724,18 @@ def _hermes_to_crosscut_status(status: str) -> str:
 
 def _work_event_request(event_type: str, work_item_id: str, payload: dict[str, Any]) -> Any:
     return _crosscut_request("CreateWorkEventRequest", event_type=event_type, work_item_id=work_item_id, source="hermes-kanban-crosscut", payload=payload)
+
+
+def _worker_handoff_capture(*, marker: str, text: str, final_response_chars: int) -> dict[str, Any]:
+    return {
+        "schema": "crosscut-worker-handoff-capture.v1",
+        "source": "final_assistant_message",
+        "marker": marker,
+        "text": text,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "captured_at": int(time.time()),
+        "final_response_chars": int(final_response_chars),
+    }
 
 
 def _comment_request(work_item_id: str, author: str, body: str) -> Any:

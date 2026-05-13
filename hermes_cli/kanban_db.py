@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -1704,6 +1705,125 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+def _load_json_object_text(value: Optional[str]) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def attach_worker_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    marker: str,
+    text: str,
+    final_response_chars: int,
+    run_id: Optional[int] = None,
+    captured_at: Optional[int] = None,
+) -> bool:
+    """Attach final assistant handoff evidence to a terminal Kanban run.
+
+    This stores only the extracted handoff block, not the full assistant
+    response. Existing metadata keys are preserved, and repeated calls with
+    the same block hash rewrite nothing.
+    """
+    block = (text or "").strip()
+    if not block:
+        return False
+    now = int(captured_at if captured_at is not None else time.time())
+    capture = {
+        "schema": "crosscut-worker-handoff-capture.v1",
+        "source": "final_assistant_message",
+        "marker": marker,
+        "text": block,
+        "sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+        "captured_at": now,
+        "final_response_chars": int(final_response_chars),
+    }
+    changed = False
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not task_row or task_row["status"] not in {"done", "blocked"}:
+            return False
+        if run_id is not None:
+            run = conn.execute(
+                """
+                SELECT * FROM task_runs
+                 WHERE id = ?
+                   AND task_id = ?
+                   AND (outcome IN ('completed', 'blocked') OR status IN ('done', 'blocked'))
+                """,
+                (int(run_id), task_id),
+            ).fetchone()
+        else:
+            run = conn.execute(
+                """
+                SELECT * FROM task_runs
+                 WHERE task_id = ?
+                   AND (outcome IN ('completed', 'blocked') OR status IN ('done', 'blocked'))
+                 ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+        if not run:
+            return False
+        target_run_id = int(run["id"])
+        metadata = _load_json_object_text(run["metadata"])
+        existing = metadata.get("worker_handoff")
+        if not (isinstance(existing, dict) and existing.get("sha256") == capture["sha256"]):
+            metadata["worker_handoff"] = capture
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), target_run_id),
+            )
+            changed = True
+
+        event_kind = "completed" if (run["outcome"] == "completed" or run["status"] == "done") else "blocked"
+        event = conn.execute(
+            """
+            SELECT * FROM task_events
+             WHERE task_id = ?
+               AND kind = ?
+               AND run_id = ?
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (task_id, event_kind, target_run_id),
+        ).fetchone()
+        if not event:
+            event = conn.execute(
+                """
+                SELECT * FROM task_events
+                 WHERE task_id = ?
+                   AND kind = ?
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (task_id, event_kind),
+            ).fetchone()
+        if event:
+            payload = _load_json_object_text(event["payload"])
+            existing_event = payload.get("worker_handoff")
+            if not (
+                isinstance(existing_event, dict)
+                and existing_event.get("sha256") == capture["sha256"]
+            ):
+                payload["worker_handoff"] = capture
+                conn.execute(
+                    "UPDATE task_events SET payload = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(event["id"])),
+                )
+                changed = True
+    return changed
 
 
 def _end_run(

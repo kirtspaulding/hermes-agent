@@ -117,6 +117,7 @@ class FakeCrossCutRepo:
             error=request.error,
             started_at=request.started_at,
             ended_at=request.ended_at,
+            metadata=request.metadata,
         )
         self.runs[run.id] = run
         return run
@@ -241,6 +242,35 @@ def test_crosscut_provider_create_list_show_and_lifecycle():
     assert details.comments[0].body == "hello"
     assert any(event.kind == "hermes_task_completed" for event in details.events)
     assert details.runs[-1].outcome == "done"
+    assert details.runs[-1].metadata == {"ok": True}
+
+
+def test_crosscut_provider_attaches_worker_handoff_to_terminal_run():
+    repo = FakeCrossCutRepo()
+    provider = kp.CrossCutKanbanCliProvider(repository=repo, backend_id="backend", board="proto")
+    task = provider.create_task(title="x", body=None, assignee="worker", created_by="tester", workspace_kind="scratch", workspace_path=None, tenant=None, priority=0, parents=(), triage=False, idempotency_key="x", max_runtime_seconds=None, skills=None, max_retries=None)
+    assert provider.claim_task(task.id, ttl_seconds=60) is not None
+    assert provider.complete_task(task.id, result=None, summary="done", metadata={"existing": True}, expected_run_id=None)
+
+    assert provider.attach_worker_handoff(
+        task.id,
+        marker="crosscut-worker-handoff:v1",
+        text='crosscut-worker-handoff:v1\n{"completed": true}',
+        final_response_chars=50,
+    )
+    assert not provider.attach_worker_handoff(
+        task.id,
+        marker="crosscut-worker-handoff:v1",
+        text='crosscut-worker-handoff:v1\n{"completed": true}',
+        final_response_chars=50,
+    )
+
+    details = provider.get_task_details(task.id)
+    capture = details.runs[-1].metadata["worker_handoff"]
+    assert details.runs[-1].metadata["existing"] is True
+    assert capture["source"] == "final_assistant_message"
+    assert capture["text"].startswith("crosscut-worker-handoff:v1")
+    assert [event.kind for event in details.events].count("hermes_task_worker_handoff_attached") == 1
 
 
 def test_crosscut_provider_links_parent_child_by_task_ids():

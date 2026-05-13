@@ -71,6 +71,50 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
+_CROSSCUT_WORKER_HANDOFF_MARKER = "crosscut-worker-handoff:v1"
+
+
+def _extract_final_crosscut_worker_handoff_text(output: str) -> Optional[str]:
+    """Return the final CrossCut worker handoff block, if present."""
+    stripped = (output or "").strip()
+    marker_index = stripped.rfind(_CROSSCUT_WORKER_HANDOFF_MARKER)
+    if marker_index < 0:
+        return None
+    return stripped[marker_index:].strip()
+
+
+def _persist_kanban_worker_handoff(final_response: str) -> None:
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return
+    handoff_text = _extract_final_crosscut_worker_handoff_text(final_response)
+    if not handoff_text:
+        return
+    run_id = None
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if raw_run_id:
+        try:
+            run_id = int(raw_run_id)
+        except ValueError:
+            run_id = None
+    try:
+        from hermes_cli.kanban_provider import get_kanban_cli_provider
+
+        get_kanban_cli_provider().attach_worker_handoff(
+            task_id,
+            run_id=run_id,
+            marker=_CROSSCUT_WORKER_HANDOFF_MARKER,
+            text=handoff_text,
+            final_response_chars=len(final_response),
+        )
+    except Exception:
+        logger.warning(
+            "Failed to attach CrossCut worker handoff for Kanban task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -15330,6 +15374,9 @@ class AIAgent:
                         break  # First non-empty string wins
             except Exception as exc:
                 logger.warning("transform_llm_output hook failed: %s", exc)
+
+        if final_response and not interrupted:
+            _persist_kanban_worker_handoff(final_response)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.

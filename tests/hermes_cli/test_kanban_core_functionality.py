@@ -11,6 +11,7 @@ parity across every registered verb.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -1964,6 +1965,138 @@ def test_completed_event_payload_summary_none_when_missing(kanban_home):
         assert comp.payload.get("summary") is None
     finally:
         conn.close()
+
+
+def test_attach_worker_handoff_after_complete_updates_run_and_event(kanban_home):
+    text = 'crosscut-worker-handoff:v1\n{"completed": true}'
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done", metadata={"files": 1})
+        run = kb.latest_run(conn, tid)
+
+        assert kb.attach_worker_handoff(
+            conn,
+            tid,
+            run_id=run.id,
+            marker="crosscut-worker-handoff:v1",
+            text=text,
+            final_response_chars=99,
+            captured_at=123,
+        )
+
+        updated_run = kb.latest_run(conn, tid)
+        assert updated_run.metadata["files"] == 1
+        capture = updated_run.metadata["worker_handoff"]
+        assert capture["source"] == "final_assistant_message"
+        assert capture["text"] == text
+        assert capture["sha256"] == digest
+        assert capture["captured_at"] == 123
+        assert capture["final_response_chars"] == 99
+        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(completed) == 1
+        assert completed[0].payload["summary"] == "done"
+        assert completed[0].payload["worker_handoff"]["sha256"] == digest
+    finally:
+        conn.close()
+
+
+def test_attach_worker_handoff_after_block_updates_run_and_event(kanban_home):
+    text = 'crosscut-worker-handoff:v1\n{"completed": false}'
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.block_task(conn, tid, reason="blocked")
+        run = kb.latest_run(conn, tid)
+
+        assert kb.attach_worker_handoff(
+            conn,
+            tid,
+            run_id=run.id,
+            marker="crosscut-worker-handoff:v1",
+            text=text,
+            final_response_chars=len(text),
+            captured_at=123,
+        )
+
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+        assert len(blocked) == 1
+        assert blocked[0].payload["reason"] == "blocked"
+        assert blocked[0].payload["worker_handoff"]["text"] == text
+        assert kb.latest_run(conn, tid).metadata["worker_handoff"]["text"] == text
+    finally:
+        conn.close()
+
+
+def test_attach_worker_handoff_is_idempotent(kanban_home):
+    text = 'crosscut-worker-handoff:v1\n{"completed": true}'
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done", metadata={"existing": True})
+        run = kb.latest_run(conn, tid)
+        kwargs = {
+            "run_id": run.id,
+            "marker": "crosscut-worker-handoff:v1",
+            "text": text,
+            "final_response_chars": len(text),
+            "captured_at": 123,
+        }
+
+        assert kb.attach_worker_handoff(conn, tid, **kwargs)
+        assert not kb.attach_worker_handoff(conn, tid, **kwargs)
+
+        completed = [e for e in kb.list_events(conn, tid) if e.kind == "completed"]
+        assert len(completed) == 1
+        assert list(completed[0].payload).count("worker_handoff") == 1
+        assert kb.latest_run(conn, tid).metadata["existing"] is True
+    finally:
+        conn.close()
+
+
+def test_attach_worker_handoff_noops_for_nonterminal_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+
+        assert not kb.attach_worker_handoff(
+            conn,
+            tid,
+            marker="crosscut-worker-handoff:v1",
+            text="crosscut-worker-handoff:v1\n{}",
+            final_response_chars=30,
+        )
+    finally:
+        conn.close()
+
+
+def test_cli_runs_json_round_trips_worker_handoff_metadata(kanban_home):
+    text = 'crosscut-worker-handoff:v1\n{"completed": true}'
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.complete_task(conn, tid, summary="done")
+        run = kb.latest_run(conn, tid)
+        kb.attach_worker_handoff(
+            conn,
+            tid,
+            run_id=run.id,
+            marker="crosscut-worker-handoff:v1",
+            text=text,
+            final_response_chars=len(text),
+            captured_at=123,
+        )
+    finally:
+        conn.close()
+    out = run_slash(f"runs {tid} --json")
+    data = json.loads(out)
+    assert data[0]["metadata"]["worker_handoff"]["text"] == text
 
 
 # -------------------------------------------------------------------------
